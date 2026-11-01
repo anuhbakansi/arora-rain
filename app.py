@@ -3,26 +3,28 @@ ARORA RAIN - AI Learning Companion
 ===================================
 Run with:  streamlit run app.py
 
-The file is organised into clearly separated sections (think of each one as a
-module). Every section has a comment explaining which library it uses and why.
+Libraries used (and nothing else besides the Python standard library):
+  * Streamlit   -> the whole interface: sidebar, forms, tabs, uploads, downloads, animations (CSS/HTML)
+  * Pandas      -> learning records (exams, topics, activity) as DataFrames, grouping and pivots
+  * NumPy       -> statistics: averages, trend line, consistency, streak helpers
+  * Matplotlib  -> educational charts (progress donut, difficulty bars, topic performance)
+  * Seaborn     -> statistical charts (score trend, distribution, activity heatmap)
+  * google-genai (official Google Gen AI SDK) -> every AI feature, using a Gemini API key
 
-  1. CONFIG & STYLING      -> Streamlit (UI, CSS gradients, animations)
-  2. STORAGE               -> JSON file + Pandas (user progress)
-  3. AI ENGINE             -> Requests (Claude API). Offline fallback below.
-  4. OFFLINE ENGINE        -> Requests + BeautifulSoup4 (Wikipedia) +
-                              Scikit-learn (TF-IDF) + NumPy
-  5. DOCUMENT EXPORT       -> python-docx (Word) + FPDF2 (PDF)
-  6. CHARTS                -> Plotly, Matplotlib, Seaborn
-  7. PAGES                 -> Streamlit pages selected from the sidebar
+The API key is NEVER hard-coded or typed into the page. It is read from
+Streamlit secrets (.streamlit/secrets.toml) or an environment variable.
+
+File layout (sections of this single file):
+  1. CONFIG & STYLING   2. STORAGE   3. GEMINI AI ENGINE   4. AI FEATURES (prompts)
+  5. EXPORT HELPERS     6. CHARTS    7. PAGES              8. MAIN (sidebar navigation)
 """
 
-import io
 import json
 import os
 import random
 import re
+import time
 import uuid
-from collections import Counter
 from datetime import date, datetime, timedelta
 from urllib.parse import quote_plus
 
@@ -31,30 +33,31 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
-import requests
 import seaborn as sns
 import streamlit as st
 import streamlit.components.v1 as components
-from bs4 import BeautifulSoup
-from docx import Document
-from fpdf import FPDF
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 
 # =============================================================================
 # 1. CONFIG & STYLING  (Streamlit)
 # =============================================================================
 APP_NAME = "Arora Rain"
 DATA_FILE = "arora_data.json"
-ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
-DEFAULT_MODEL = "claude-sonnet-5-5"
-WIKI_API = "https://en.wikipedia.org/w/api.php"
-HTTP_HEADERS = {"User-Agent": "AroraRain/1.0 (educational learning app)"}
+DEFAULT_MODEL = "gemini-2.5-flash"
 
-st.set_page_config(page_title=f"{APP_NAME} - AI Learning Companion",
-                   page_icon="🌧️", layout="wide")
+st.set_page_config(page_title=f"{APP_NAME} - AI Learning Companion", page_icon="🌧️", layout="wide")
+
+# The Google Gen AI SDK is required; show a friendly message if it is missing.
+try:
+    from google import genai
+    from google.genai import errors as genai_errors
+    from google.genai import types as genai_types
+except ImportError:
+    st.error("The Google Gen AI SDK is not installed. Run:  `pip install -r requirements.txt`  "
+             "(or `pip install google-genai`) and restart the app.")
+    st.stop()
+
+PRIMARY, SECONDARY, ACCENT = "#4f46e5", "#7c3aed", "#06b6d4"
+PALETTE = [PRIMARY, SECONDARY, ACCENT, "#22c55e", "#f59e0b", "#ef4444"]
 
 CUSTOM_CSS = """
 <style>
@@ -69,10 +72,10 @@ html, body, [class*="css"] { font-family: 'Poppins', sans-serif; }
   padding: 28px 32px; border-radius: 20px; color: white; margin-bottom: 22px;
   box-shadow: 0 10px 30px rgba(79,70,229,.35);
 }
-.hero h1 { margin: 0; font-size: 2.2rem; font-weight: 700; }
-.hero p { margin: 6px 0 0; opacity: .92; font-size: 1.02rem; }
+.hero h1 { margin: 0; font-size: 2.2rem; font-weight: 700; color: white; }
+.hero p { margin: 6px 0 0; opacity: .92; font-size: 1.02rem; color: white; }
 .card {
-  background: rgba(255,255,255,.04); border: 1px solid rgba(124,58,237,.25);
+  background: rgba(124,58,237,.06); border: 1px solid rgba(124,58,237,.25);
   border-radius: 16px; padding: 18px 20px; margin-bottom: 14px;
   transition: transform .25s ease, box-shadow .25s ease; animation: fadeUp .6s ease;
 }
@@ -95,16 +98,15 @@ section[data-testid="stSidebar"] * { color: #f1f5f9 !important; }
 </style>
 """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+sns.set_theme(style="whitegrid", font="DejaVu Sans")
 
 
 def hero(title, subtitle):
-    st.markdown(f'<div class="hero"><h1>{title}</h1><p>{subtitle}</p></div>',
-                unsafe_allow_html=True)
+    st.markdown(f'<div class="hero"><h1>{title}</h1><p>{subtitle}</p></div>', unsafe_allow_html=True)
 
 
-def card(title, body_html):
-    st.markdown(f'<div class="card"><h4>{title}</h4>{body_html}</div>',
-                unsafe_allow_html=True)
+def card(title, body):
+    st.markdown(f'<div class="card"><h4>{title}</h4>{body}</div>', unsafe_allow_html=True)
 
 
 # =============================================================================
@@ -115,7 +117,7 @@ def default_data():
 
 
 def load_data():
-    """Load saved progress. A corrupted or missing file yields fresh data."""
+    """Load saved progress. A missing or corrupted file gives fresh data."""
     if os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
@@ -145,40 +147,38 @@ def log_activity(kind, detail=""):
 def mark_completed(topic, source="manual"):
     data = load_data()
     if not any(t["topic"].lower() == topic.lower() for t in data["completed_topics"]):
-        data["completed_topics"].append(
-            {"topic": topic, "source": source, "date": date.today().isoformat()})
+        data["completed_topics"].append({"topic": topic, "source": source, "date": date.today().isoformat()})
         save_data(data)
 
 
 def unmark_completed(topic):
     data = load_data()
-    data["completed_topics"] = [t for t in data["completed_topics"]
-                                if t["topic"].lower() != topic.lower()]
+    data["completed_topics"] = [t for t in data["completed_topics"] if t["topic"].lower() != topic.lower()]
     save_data(data)
 
 
 def record_exam(topic, difficulty, score, total):
     data = load_data()
-    data["exams"].append({
-        "date": datetime.now().strftime("%Y-%m-%d %H:%M"), "topic": topic,
-        "difficulty": difficulty, "score": score, "total": total,
-        "percent": round(100 * score / total, 1) if total else 0})
+    data["exams"].append({"date": datetime.now().strftime("%Y-%m-%d %H:%M"), "topic": topic,
+                          "difficulty": difficulty, "score": score, "total": total,
+                          "percent": round(100 * score / total, 1) if total else 0.0})
     save_data(data)
 
 
-def exams_dataframe():
-    data = load_data()
-    return pd.DataFrame(data["exams"]) if data["exams"] else pd.DataFrame(
-        columns=["date", "topic", "difficulty", "score", "total", "percent"])
+def exams_df():
+    """Exam history as a Pandas DataFrame (empty but well-formed when there is no data)."""
+    exams = load_data()["exams"]
+    cols = ["date", "topic", "difficulty", "score", "total", "percent"]
+    return pd.DataFrame(exams, columns=cols) if exams else pd.DataFrame(columns=cols)
 
 
 def current_streak():
     dates = sorted({a["date"] for a in load_data()["activity"]}, reverse=True)
     if not dates:
         return 0
-    streak, day = 0, date.today()
-    if dates[0] != day.isoformat():       # allow streak to continue from yesterday
-        day -= timedelta(days=1)
+    day, streak = date.today(), 0
+    if dates[0] != day.isoformat():
+        day -= timedelta(days=1)                      # streak may continue from yesterday
     for d in dates:
         if d == day.isoformat():
             streak += 1
@@ -189,469 +189,264 @@ def current_streak():
 
 
 # =============================================================================
-# 3. AI ENGINE  (Requests -> Claude API)
+# 3. GEMINI AI ENGINE  (official Google Gen AI SDK)
 # =============================================================================
 class AIError(Exception):
-    pass
+    """Any problem talking to Gemini, with a message that is safe to show the user."""
 
 
 def get_api_key():
-    key = st.session_state.get("api_key", "").strip()
-    if key:
-        return key
-    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-    if key:
-        return key
-    try:
-        return str(st.secrets.get("ANTHROPIC_API_KEY", "")).strip()
-    except Exception:
-        return ""
+    """Read the key from Streamlit secrets or environment variables - never from code or the UI."""
+    for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        try:
+            val = st.secrets.get(name, "")
+        except Exception:                             # no secrets.toml present
+            val = ""
+        val = val or os.environ.get(name, "")
+        val = re.sub(r"\s+", "", str(val)).strip("\"'`")
+        if val:
+            return val
+    return ""
 
 
-def ai_enabled():
-    return bool(get_api_key())
+def get_model():
+    name = st.session_state.get("model") or ""
+    if not name:
+        try:
+            name = st.secrets.get("GEMINI_MODEL", "")
+        except Exception:
+            name = ""
+    return (name or os.environ.get("GEMINI_MODEL", "") or DEFAULT_MODEL).strip()
 
 
-def call_llm(prompt, system="You are Arora Rain, a friendly expert teacher.",
-             max_tokens=4000, temperature=0.4):
-    """Send one prompt to the Claude Messages API using the Requests library."""
+@st.cache_resource(show_spinner=False)
+def _client(api_key):
+    return genai.Client(api_key=api_key)
+
+
+def friendly_error(code, message):
+    text = str(message)
+    low = text.lower()
+    if code in (400, 401, 403) and ("api key" in low or "api_key" in low or code in (401, 403)):
+        return ("Google rejected the API key. Create a new key at aistudio.google.com -> Get API key, "
+                "update GEMINI_API_KEY and restart the app.")
+    if code == 404:
+        return f"Model '{get_model()}' was not found. Change the Model name in the sidebar."
+    if code == 429:
+        return "Free-tier rate limit reached. Wait a minute and try again (or request fewer questions)."
+    if code in (500, 503):
+        return "Gemini is busy right now. Please try again in a moment."
+    return f"Gemini error {code}: {text[:300]}"
+
+
+def generate(prompt, system="You are Arora Rain, a friendly and accurate expert teacher.",
+             json_mode=False, temperature=0.5):
+    """Call Gemini through the official SDK. Retries briefly on rate-limit / overload errors."""
     key = get_api_key()
     if not key:
-        raise AIError("No API key configured.")
-    payload = {"model": st.session_state.get("model", DEFAULT_MODEL),
-               "max_tokens": max_tokens, "temperature": temperature,
-               "system": system, "messages": [{"role": "user", "content": prompt}]}
-    headers = {"x-api-key": key, "anthropic-version": "2023-06-01",
-               "content-type": "application/json"}
-    try:
-        r = requests.post(ANTHROPIC_URL, headers=headers, json=payload, timeout=120)
-    except requests.RequestException as e:
-        raise AIError(f"Network error: {e}")
-    if r.status_code != 200:
+        raise AIError("No Gemini API key found. See the setup steps on the Home page.")
+    kwargs = {"system_instruction": system, "temperature": temperature}
+    if json_mode:
+        kwargs["response_mime_type"] = "application/json"
+    config = genai_types.GenerateContentConfig(**kwargs)
+    for attempt in range(3):
         try:
-            msg = r.json().get("error", {}).get("message", r.text)
-        except ValueError:
-            msg = r.text
-        raise AIError(f"API error {r.status_code}: {msg}")
-    blocks = r.json().get("content", [])
-    return "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+            resp = _client(key).models.generate_content(model=get_model(), contents=prompt, config=config)
+            text = resp.text
+            if not text or not text.strip():
+                raise AIError("Gemini returned an empty answer (it may have been blocked). Try rephrasing.")
+            return text
+        except AIError:
+            raise
+        except genai_errors.APIError as e:
+            code = getattr(e, "code", None)
+            if code in (429, 500, 503) and attempt < 2:
+                time.sleep(5 * (attempt + 1))
+                continue
+            raise AIError(friendly_error(code, getattr(e, "message", e)))
+        except Exception as e:                        # network problems etc.
+            raise AIError(f"Could not reach Gemini: {e}")
+    raise AIError("Gemini did not respond. Please try again.")
 
 
-def extract_json(text):
-    """Pull the first JSON object/array out of an LLM reply."""
+def parse_json(text):
+    """Parse a JSON reply, tolerating code fences or extra text around it."""
     text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
-    starts = [i for i in (text.find("{"), text.find("[")) if i != -1]
-    if not starts:
-        raise AIError("The AI reply did not contain JSON.")
-    start = min(starts)
-    end = max(text.rfind("}"), text.rfind("]"))
     try:
-        return json.loads(text[start:end + 1])
-    except json.JSONDecodeError as e:
-        raise AIError(f"Could not parse AI JSON: {e}")
-
-
-def with_fallback(ai_func, offline_func, what):
-    """Use the AI when a key exists; fall back to the offline engine on failure."""
-    if ai_enabled():
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    starts = [i for i in (text.find("{"), text.find("[")) if i != -1]
+    end = max(text.rfind("}"), text.rfind("]"))
+    if starts and end > min(starts):
         try:
-            return ai_func(), "ai"
-        except AIError as e:
-            st.warning(f"AI request failed ({e}). Using the offline engine instead.")
-    else:
-        st.info(f"No API key set - using the offline engine for {what}. "
-                "Add a Claude API key in the sidebar for richer results.")
-    return offline_func(), "offline"
+            return json.loads(text[min(starts):end + 1])
+        except json.JSONDecodeError:
+            pass
+    raise AIError("The AI reply was not valid JSON. Please try again.")
 
 
-# ---- AI prompts -------------------------------------------------------------
+def require_ai():
+    """Show setup help and return False when no key is configured."""
+    if get_api_key():
+        return True
+    st.warning("🔑 Gemini API key not found. Follow the 3 steps below, then restart the app.")
+    st.markdown(SETUP_HELP)
+    return False
+
+
+SETUP_HELP = """
+1. Create a free key at **https://aistudio.google.com** -> *Get API key*.
+2. Create the file `.streamlit/secrets.toml` next to `app.py` and add:
+   ```toml
+   GEMINI_API_KEY = "paste-your-key-here"
+   ```
+   *(or set the environment variable `GEMINI_API_KEY` before starting the app)*
+3. Restart: `streamlit run app.py`
+"""
+
+
+# =============================================================================
+# 4. AI FEATURES  (prompts -> structured results)
+# =============================================================================
 def ai_explain(topic, level):
-    prompt = (f"Explain the topic '{topic}' for a {level} learner in Markdown with these sections: "
-              "## Simple Explanation, ## Key Concepts (bullets), ## Examples (2-3 concrete ones), "
-              "## Common Mistakes, ## Quick Recap. Keep it clear and friendly.")
-    return call_llm(prompt, max_tokens=2500)
+    prompt = (f"Explain '{topic}' in simple language for a {level} learner. Use Markdown with exactly these "
+              "sections: ## Simple Explanation, ## Key Concepts (bullet list), ## Examples (2-3 concrete "
+              "examples), ## Common Mistakes, ## Quick Recap. Be clear, friendly and accurate.")
+    return generate(prompt, temperature=0.6)
 
 
 def ai_summary(text):
-    prompt = ("Summarise the lecture text below. Reply ONLY with JSON: "
-              '{"short": "3-4 sentence summary", "detailed": "multi-paragraph detailed summary", '
-              '"key_points": ["important point", ...]}\n\nTEXT:\n' + text[:15000])
-    d = extract_json(call_llm(prompt, max_tokens=3000))
-    return {"short": d.get("short", ""), "detailed": d.get("detailed", ""),
-            "key_points": d.get("key_points", [])}
+    prompt = ("Summarise the lecture text below. Reply with JSON: "
+              '{"short": "3-4 sentence summary", "detailed": "a detailed multi-paragraph summary '
+              '(separate paragraphs with a blank line)", "key_points": ["important point", ...]} '
+              "with 5-8 key points.\n\nLECTURE TEXT:\n" + text[:30000])
+    d = parse_json(generate(prompt, json_mode=True, temperature=0.3))
+    if not isinstance(d, dict):
+        raise AIError("Unexpected summary format. Please try again.")
+    return {"short": str(d.get("short", "")), "detailed": str(d.get("detailed", "")),
+            "key_points": [str(k) for k in d.get("key_points", [])]}
 
 
-def ai_notes(text, title):
-    prompt = ("Turn the lecture content into organised study notes. Reply ONLY with JSON: "
-              '{"title": str, "sections": [{"heading": str, "points": [str]}], '
-              '"definitions": [{"term": str, "meaning": str}], "examples": [str], '
-              '"key_points": [str]}\n\nTITLE: ' + title + "\nCONTENT:\n" + text[:15000])
-    d = extract_json(call_llm(prompt, max_tokens=3500))
-    d.setdefault("title", title)
-    for k in ("sections", "definitions", "examples", "key_points"):
+NOTES_SHAPE = ('{"title": str, "sections": [{"heading": str, "points": [str]}], '
+               '"definitions": [{"term": str, "meaning": str}], "examples": [str], "key_points": [str]}')
+
+
+def ai_notes(source, title, from_topic):
+    if from_topic:
+        prompt = (f"Create well-organised study notes on the topic '{source}'. Reply with JSON shaped "
+                  f"exactly like {NOTES_SHAPE}. Use 4-7 sections with clear headings, 4-8 definitions, "
+                  "3-5 worked examples and 6-8 key points.")
+    else:
+        prompt = (f"Convert the lecture content below into organised study notes. Reply with JSON shaped "
+                  f"exactly like {NOTES_SHAPE}. Use clear headings, definitions, examples (from the text or "
+                  "invented to illustrate) and key points.\n\nLECTURE CONTENT:\n" + source[:30000])
+    d = parse_json(generate(prompt, json_mode=True, temperature=0.4))
+    if not isinstance(d, dict) or not d.get("sections"):
+        raise AIError("Could not build notes from the AI reply. Please try again.")
+    d["title"] = title or d.get("title") or "Study Notes"
+    for k in ("definitions", "examples", "key_points"):
         d.setdefault(k, [])
     return d
 
 
-def ai_exam(topic, difficulty, n):
-    questions, seen = [], []
+def ai_exam(topic, difficulty, n, progress=None):
+    """Generate n MCQs in batches. Options are shuffled so the answer position is not biased."""
+    questions, seen, fails = [], [], 0
     while len(questions) < n:
-        batch = min(15, n - len(questions))
-        avoid = ("\nDo NOT repeat these questions: " + " | ".join(seen[-40:])) if seen else ""
-        prompt = (f"Create {batch} multiple-choice questions about '{topic}'. Difficulty: {difficulty}"
-                  " (if Mixed, vary easy/medium/hard). Reply ONLY with a JSON array of objects: "
-                  '{"question": str, "options": [4 strings], "answer": index 0-3 of the correct option, '
-                  '"explanation": str, "difficulty": "Easy|Medium|Hard"}. '
-                  "Exactly one option must be correct." + avoid)
+        batch = min(20, n - len(questions))
+        avoid = ("\nDo NOT repeat any of these questions: " + " | ".join(seen[-60:])) if seen else ""
+        prompt = (f"Create {batch} multiple-choice questions about '{topic}'. Difficulty: {difficulty} "
+                  "(for 'Mixed', vary between Easy, Medium and Hard). Reply with a JSON array of objects: "
+                  '{"question": str, "options": [exactly 4 strings], "answer": 0-3 index of the correct '
+                  'option, "explanation": str explaining why the answer is correct, '
+                  '"difficulty": "Easy" | "Medium" | "Hard"}. Exactly one option must be correct.' + avoid)
         added = 0
-        for q in extract_json(call_llm(prompt, max_tokens=6000, temperature=0.7)):
+        data = parse_json(generate(prompt, json_mode=True, temperature=0.8))
+        if isinstance(data, dict):
+            data = data.get("questions", [])
+        for q in data if isinstance(data, list) else []:
             try:
-                opts = [str(o) for o in q["options"]][:4]
+                opts = [str(o).strip() for o in q["options"]][:4]
                 ans = int(q["answer"])
-                if len(opts) == 4 and 0 <= ans < 4 and q["question"] not in seen:
-                    questions.append({"question": str(q["question"]), "options": opts,
-                                      "answer": ans, "explanation": str(q.get("explanation", "")),
-                                      "difficulty": str(q.get("difficulty", difficulty))})
-                    seen.append(str(q["question"]))
+                stem = str(q["question"]).strip()
+                if len(opts) == 4 and len(set(opts)) == 4 and 0 <= ans < 4 and stem not in seen:
+                    correct = opts[ans]
+                    random.shuffle(opts)
+                    questions.append({"question": stem, "options": opts, "answer": opts.index(correct),
+                                      "explanation": str(q.get("explanation", "")).strip(),
+                                      "difficulty": str(q.get("difficulty", difficulty)).title()})
+                    seen.append(stem)
                     added += 1
             except (KeyError, ValueError, TypeError):
                 continue
-        if added == 0:
-            raise AIError("The AI returned no valid questions.")
+        fails = 0 if added else fails + 1
+        if fails >= 2:
+            raise AIError("Gemini could not produce valid questions for that topic. Try a clearer topic.")
+        if progress:
+            progress(min(len(questions), n) / n)
     return questions[:n]
 
 
 def ai_roadmap(field, level, hours):
-    prompt = (f"Create a personalised learning roadmap. Field: {field}. Level: {level}. "
-              f"Available time: {hours} hours per week. Reply ONLY with JSON: "
-              '{"title": str, "summary": str, "total_weeks": int, "phases": [{"name": str, '
-              '"weeks": int, "topics": [str], "milestone": str, '
-              '"resources": [{"title": str, "type": "Course|Book|Video|Practice|Docs"}]}]}. '
-              "Use 4-6 phases and 3-6 topics per phase. Resource titles should be real, well-known resources.")
-    d = extract_json(call_llm(prompt, max_tokens=3500))
+    prompt = (f"Create a personalised learning roadmap. Field: {field}. Skill level: {level}. Available time: "
+              f"{hours} hours per week. Reply with JSON: "
+              '{"title": str, "summary": str, "total_weeks": int, "phases": [{"name": str, "weeks": int, '
+              '"topics": [3-6 short topic strings], "milestone": str, "resources": [{"title": str, '
+              '"type": "Course" | "Book" | "Video" | "Practice" | "Docs"}]}]}. Use 4-6 phases ordered from '
+              "easiest to hardest, realistic week counts for the available time, and real, well-known "
+              "resource titles.")
+    d = parse_json(generate(prompt, json_mode=True, temperature=0.5))
     if not isinstance(d, dict) or not d.get("phases"):
-        raise AIError("Roadmap JSON was incomplete.")
+        raise AIError("Roadmap reply was incomplete. Please try again.")
+    for p in d["phases"]:
+        p["weeks"] = int(p.get("weeks", 1) or 1)
+        p.setdefault("topics", [])
+        p.setdefault("resources", [])
+        p.setdefault("milestone", "")
     d.setdefault("title", f"{field} Roadmap")
     d.setdefault("summary", "")
-    d.setdefault("total_weeks", sum(int(p.get("weeks", 1)) for p in d["phases"]))
+    d["total_weeks"] = int(sum(p["weeks"] for p in d["phases"]))
     return d
 
 
-# =============================================================================
-# 4. OFFLINE ENGINE  (Requests + BeautifulSoup4 + Scikit-learn + NumPy)
-# =============================================================================
-STOPWORDS = set("""a about above after again all also an and any are as at be because been before being
-between both but by can could did do does doing down during each few for from further had has have having he
-her here him his how i if in into is it its just may me more most my no nor not of off on once only or other
-our out over own same she should so some such than that the their them then there these they this those
-through to too under until up very was we were what when where which while who why will with would you your
-however although among many much used use using called known one two three also often""".split())
-
-SKIP_HEADINGS = {"references", "external links", "see also", "notes", "further reading",
-                 "bibliography", "sources", "footnotes", "citations"}
-
-
-@st.cache_data(show_spinner=False, ttl=3600)
-def fetch_wikipedia(topic):
-    """Find a Wikipedia article and parse it with BeautifulSoup. Returns a dict."""
-    try:
-        s = requests.get(WIKI_API, headers=HTTP_HEADERS, timeout=12, params={
-            "action": "query", "list": "search", "srsearch": topic,
-            "srlimit": 1, "format": "json"})
-        s.raise_for_status()
-        hits = s.json().get("query", {}).get("search", [])
-        if not hits:
-            return None
-        title = hits[0]["title"]
-        p = requests.get(WIKI_API, headers=HTTP_HEADERS, timeout=15, params={
-            "action": "parse", "page": title, "prop": "text", "format": "json",
-            "redirects": 1, "disableeditsection": 1})
-        p.raise_for_status()
-        html = p.json()["parse"]["text"]["*"]
-    except (requests.RequestException, KeyError, ValueError):
-        return None
-
-    soup = BeautifulSoup(html, "html.parser")
-    for tag in soup.select("sup, table, style, .reference, .mw-editsection, .navbox, .hatnote"):
-        tag.decompose()
-    sections, heading, buf = [], "Introduction", []
-    for el in soup.find_all(["h2", "p"]):
-        if el.name == "h2":
-            if buf:
-                sections.append({"heading": heading, "text": " ".join(buf)})
-            heading, buf = el.get_text(" ", strip=True), []
-        else:
-            t = re.sub(r"\s+", " ", el.get_text(" ", strip=True))
-            if len(t) > 40:
-                buf.append(t)
-    if buf:
-        sections.append({"heading": heading, "text": " ".join(buf)})
-    sections = [s for s in sections if s["heading"].lower() not in SKIP_HEADINGS]
-    if not sections:
-        return None
-    return {"title": title, "url": f"https://en.wikipedia.org/wiki/{quote_plus(title.replace(' ', '_'))}",
-            "sections": sections}
-
-
-def split_sentences(text):
-    parts = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9])", re.sub(r"\s+", " ", text).strip())
-    return [p.strip() for p in parts if len(p.strip()) > 25]
-
-
-def rank_sentences(sentences):
-    """Score sentences with TF-IDF (Scikit-learn) + NumPy. Returns scores array."""
-    if len(sentences) < 2:
-        return np.ones(len(sentences))
-    try:
-        vec = TfidfVectorizer(stop_words="english")
-        m = vec.fit_transform(sentences)
-    except ValueError:
-        return np.ones(len(sentences))
-    scores = np.asarray(m.sum(axis=1)).ravel()
-    lengths = np.array([len(s.split()) for s in sentences], dtype=float)
-    return scores / np.sqrt(np.maximum(lengths, 1))       # mild length normalisation
-
-
-def top_sentences(sentences, k):
-    if not sentences:
-        return []
-    k = max(1, min(k, len(sentences)))
-    idx = np.sort(np.argsort(rank_sentences(sentences))[::-1][:k])   # keep original order
-    return [sentences[i] for i in idx]
-
-
-def top_keywords(text, k=10):
-    try:
-        vec = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), max_features=500)
-        m = vec.fit_transform(split_sentences(text) or [text])
-        scores = np.asarray(m.sum(axis=0)).ravel()
-        terms = np.array(vec.get_feature_names_out())
-        return [t for t in terms[np.argsort(scores)[::-1][:k]]]
-    except ValueError:
-        return []
-
-
-def offline_summary(text):
-    sents = split_sentences(text)
-    if len(sents) < 3:
-        raise ValueError("Please provide a longer text (at least a few sentences).")
-    n_detail = int(np.clip(round(len(sents) * 0.25), 6, 15))
-    detail = top_sentences(sents, n_detail)
-    paragraphs = [" ".join(detail[i:i + 3]) for i in range(0, len(detail), 3)]
-    return {"short": " ".join(top_sentences(sents, 3)),
-            "detailed": "\n\n".join(paragraphs),
-            "key_points": top_sentences(sents, 6)}
-
-
-def offline_notes(text, title, sections=None):
-    if sections is None:
-        sections = [{"heading": "Main Content", "text": text}]
-    out = {"title": title, "sections": [], "definitions": [], "examples": [], "key_points": []}
-    all_sents = []
-    for sec in sections[:8]:
-        sents = split_sentences(sec["text"])
-        all_sents += sents
-        pts = top_sentences(sents, 3)
-        if pts:
-            out["sections"].append({"heading": sec["heading"], "points": pts})
-    if sections and len(sections) > 0:
-        first = split_sentences(sections[0]["text"])
-        if first:
-            out["definitions"].append({"term": title, "meaning": first[0]})
-    for kw in top_keywords(text, 12):
-        for s in all_sents:
-            if re.search(rf"\b{re.escape(kw)}\b", s, re.I) and re.search(r"\b(is|are|refers to|means)\b", s):
-                if not any(d["term"] == kw for d in out["definitions"]):
-                    out["definitions"].append({"term": kw, "meaning": s})
-                break
-        if len(out["definitions"]) >= 5:
-            break
-    out["examples"] = [s for s in all_sents if re.search(r"for example|such as|e\.g\.|for instance", s, re.I)][:4]
-    out["key_points"] = top_sentences(all_sents, 6)
-    if not out["sections"]:
-        raise ValueError("Not enough text to build notes.")
-    return out
-
-
-def offline_explanation(topic):
-    page = fetch_wikipedia(topic)
-    if not page:
-        raise ValueError("No offline source found for that topic. Try a different spelling, "
-                         "or add a Claude API key in the sidebar.")
-    full = " ".join(s["text"] for s in page["sections"])
-    intro = split_sentences(page["sections"][0]["text"])
-    md = [f"## Simple Explanation\n{' '.join(intro[:3])}\n", "## Key Concepts"]
-    md += [f"- **{k.title()}**" for k in top_keywords(full, 8)]
-    md.append("\n## Main Ideas")
-    for sec in page["sections"][1:6]:
-        pts = top_sentences(split_sentences(sec["text"]), 2)
-        if pts:
-            md.append(f"**{sec['heading']}** - {' '.join(pts)}\n")
-    ex = [s for s in split_sentences(full) if re.search(r"for example|such as|e\.g\.|for instance", s, re.I)][:3]
-    md.append("## Examples")
-    md += [f"- {e}" for e in ex] or ["- (Examples need the AI engine - add a Claude API key in the sidebar.)"]
-    md.append(f"\n*Source: [Wikipedia - {page['title']}]({page['url']})*")
-    return "\n".join(md), full
-
-
-def offline_exam(topic, difficulty, n):
-    page = fetch_wikipedia(topic)
-    if not page:
-        raise ValueError("Could not fetch source material for that topic offline.")
-    text = " ".join(s["text"] for s in page["sections"])
-    sents = [s for s in split_sentences(text) if 50 <= len(s) <= 230]
-    words = [w for w in re.findall(r"[A-Za-z]{6,}", text) if w.lower() not in STOPWORDS]
-    freq = Counter(w.lower() for w in words)
-    pool = list(freq.keys())
-    if len(sents) < 4 or len(pool) < 8:
-        raise ValueError("Not enough source text for an offline exam.")
-    rng = random.Random(hash((topic, difficulty, n)) & 0xFFFF)
-    rng.shuffle(sents)
-    questions = []
-    for s in sents:
-        diff = difficulty if difficulty != "Mixed" else rng.choice(["Easy", "Medium", "Hard"])
-        cands = [w for w in re.findall(r"[A-Za-z]{6,}", s) if w.lower() in freq]
-        if not cands:
-            continue
-        cands.sort(key=lambda w: -freq[w.lower()])
-        target = cands[0] if diff == "Easy" else cands[min(len(cands) - 1, len(cands) // 2)] \
-            if diff == "Medium" else cands[-1]
-        tl = target.lower()
-        if diff == "Hard":                                     # look-alike distractors
-            near = [w for w in pool if w != tl and abs(len(w) - len(tl)) <= 2]
-            others = rng.sample(near, 3) if len(near) >= 3 else rng.sample([w for w in pool if w != tl], 3)
-        else:
-            others = rng.sample([w for w in pool if w != tl], 3)
-        opts = [tl] + others
-        rng.shuffle(opts)
-        blank = re.sub(rf"\b{re.escape(target)}\b", "_______", s, count=1)
-        questions.append({"question": f"Fill in the blank: {blank}",
-                          "options": [o.capitalize() if target[0].isupper() else o for o in opts],
-                          "answer": opts.index(tl),
-                          "explanation": f"The original sentence reads: \"{s}\"",
-                          "difficulty": diff})
-        if len(questions) >= n:
-            break
-    if not questions:
-        raise ValueError("Could not build questions from the source text.")
-    return questions
-
-
-def resource_link(title, rtype, field):
-    q = quote_plus(f"{title} {field}")
-    if rtype.lower() == "video":
-        return f"https://www.youtube.com/results?search_query={q}"
-    return f"https://www.google.com/search?q={q}"
-
-
-def offline_roadmap(field, level, hours):
-    base_hours = {"Beginner": 120, "Intermediate": 90, "Advanced": 70}[level]
-    total_weeks = int(np.clip(np.ceil(base_hours / max(hours, 1)), 4, 52))
-    names = {"Beginner": [("Foundations", ["Core terminology", "Basic tools & setup", "Fundamental principles"]),
-                          ("Core Concepts", ["Key theories", "Guided exercises", "Common patterns"]),
-                          ("Hands-on Practice", ["Small exercises", "Mini project", "Debugging & feedback"]),
-                          ("Review & Next Steps", ["Revision", "Self-assessment quiz", "Plan next level"])],
-             "Intermediate": [("Strengthen Basics", ["Gap analysis", "Core concepts revisited"]),
-                              ("Deep Dive", ["Advanced concepts", "Best practices", "Real-world case studies"]),
-                              ("Project Work", ["Portfolio project", "Peer review", "Optimisation"]),
-                              ("Specialise", ["Pick a niche", "Community contribution"])],
-             "Advanced": [("Expert Concepts", ["Cutting-edge topics", "Research papers"]),
-                          ("Specialisation", ["Chosen niche in depth", "Tooling & automation"]),
-                          ("Capstone", ["Large original project", "Publish / present"]),
-                          ("Mastery & Teaching", ["Mentor others", "Write about it"])]}[level]
-    weights = np.array([1.0] * len(names))
-    weeks = np.maximum(1, np.round(weights / weights.sum() * total_weeks)).astype(int)
-    kinds = ["Course", "Video", "Practice", "Book"]
-    phases = []
-    for i, (name, topics) in enumerate(names):
-        phases.append({"name": name, "weeks": int(weeks[i]),
-                       "topics": [f"{field}: {t}" for t in topics],
-                       "milestone": f"Complete all '{name}' topics and pass a self-check quiz.",
-                       "resources": [{"title": f"{field} {name}", "type": kinds[i % 4]},
-                                     {"title": f"{field} {topics[0]} tutorial", "type": "Video"}]})
-    return {"title": f"{field} Roadmap ({level})",
-            "summary": f"A {int(weeks.sum())}-week plan at about {hours} h/week.",
-            "total_weeks": int(weeks.sum()), "phases": phases}
-
-
-# ---- Topic catalogue for ML recommendations ---------------------------------
-CATALOGUE = {
-    "Python Programming": "python syntax variables functions loops programming beginner coding",
-    "Data Structures": "arrays lists trees graphs stacks queues algorithms programming",
-    "Algorithms": "sorting searching complexity recursion dynamic programming algorithms",
-    "Machine Learning": "regression classification training models data prediction supervised learning",
-    "Deep Learning": "neural networks backpropagation layers training gradient models",
-    "Statistics": "probability distribution mean variance hypothesis testing data",
-    "Linear Algebra": "vectors matrices eigenvalues transformations mathematics",
-    "Calculus": "derivatives integrals limits mathematics functions",
-    "Databases & SQL": "sql tables queries joins relational data storage",
-    "Web Development": "html css javascript browser frontend backend web",
-    "Cybersecurity": "encryption security networks attacks defence passwords",
-    "Computer Networks": "tcp ip protocols routing internet packets networks",
-    "Operating Systems": "processes threads memory scheduling kernel computers",
-    "Physics Basics": "motion force energy mechanics science physics",
-    "Chemistry Basics": "atoms molecules reactions elements science chemistry",
-    "Biology Basics": "cells genetics evolution organisms science biology",
-    "World History": "civilizations empires wars revolutions history",
-    "Economics": "markets supply demand inflation money economics",
-    "Personal Finance": "budget saving investing interest money finance",
-    "Public Speaking": "communication confidence presentation speech skills",
-    "Time Management": "productivity planning focus habits skills study",
-    "Data Visualization": "charts graphs plotting data dashboards pandas matplotlib",
-    "Natural Language Processing": "text language tokens models transformers data",
-    "Cloud Computing": "servers storage deployment scaling cloud infrastructure",
-    "English Writing": "grammar essays writing vocabulary communication",
-}
-
-
-def recommend_topics(k=5):
-    """Content-based recommender: cosine similarity between a user profile and the catalogue."""
-    data = load_data()
-    studied = [t["topic"] for t in data["completed_topics"]] + [e["topic"] for e in data["exams"]]
-    df = exams_dataframe()
-    weak = []
+def ai_recommendations(df, completed):
+    weak = ""
     if not df.empty:
-        avg = df.groupby("topic")["percent"].mean()
-        weak = list(avg[avg < 60].index)
-    studied_l = {s.lower() for s in studied}
-    names = [n for n in CATALOGUE if n.lower() not in studied_l]
-    if not studied:
-        return [(n, None) for n in list(CATALOGUE)[:k]]
-    profile = " ".join(studied + weak * 2)                    # weak topics weigh double
-    docs = [f"{n} {CATALOGUE[n]}" for n in names]
-    vec = TfidfVectorizer(stop_words="english")
-    m = vec.fit_transform(docs + [profile])
-    sims = cosine_similarity(m[-1], m[:-1]).ravel()
-    order = np.argsort(sims)[::-1][:k]
-    return [(names[i], float(sims[i])) for i in order]
+        avg = df.groupby("topic")["percent"].mean().round(0)
+        weak = "; ".join(f"{t}: {v:.0f}%" for t, v in avg.items())
+    prompt = ("Recommend 5 next topics for this learner. Completed topics: "
+              f"{', '.join(completed) or 'none yet'}. Exam averages by topic: {weak or 'no exams yet'}. "
+              'Reply with a JSON array: [{"topic": str, "reason": str (one sentence)}].')
+    d = parse_json(generate(prompt, json_mode=True, temperature=0.6))
+    return [x for x in d if isinstance(x, dict) and "topic" in x][:5] if isinstance(d, list) else []
 
 
 # =============================================================================
-# 5. DOCUMENT EXPORT  (python-docx + FPDF2)
-# Documents are described as "blocks": ("h1"|"h2"|"p"|"bullet", text)
+# 5. EXPORT HELPERS  (plain Markdown / text downloads via Streamlit)
+# Documents are lists of blocks: ("h1"|"h2"|"p"|"bullet", text)
 # =============================================================================
 def notes_blocks(n):
     b = [("h1", n["title"])]
     for s in n.get("sections", []):
-        b.append(("h2", s["heading"]))
-        b += [("bullet", p) for p in s["points"]]
+        b.append(("h2", str(s.get("heading", ""))))
+        b += [("bullet", str(p)) for p in s.get("points", [])]
     if n.get("definitions"):
         b.append(("h2", "Definitions"))
-        b += [("bullet", f"{d['term']}: {d['meaning']}") for d in n["definitions"]]
+        b += [("bullet", f"{d.get('term', '')}: {d.get('meaning', '')}") for d in n["definitions"]]
     if n.get("examples"):
         b.append(("h2", "Examples"))
-        b += [("bullet", e) for e in n["examples"]]
+        b += [("bullet", str(e)) for e in n["examples"]]
     if n.get("key_points"):
         b.append(("h2", "Key Points"))
-        b += [("bullet", k) for k in n["key_points"]]
+        b += [("bullet", str(k)) for k in n["key_points"]]
     return b
 
 
-def summary_blocks(s, title="Lecture Summary"):
-    b = [("h1", title), ("h2", "Short Summary"), ("p", s["short"]),
-         ("h2", "Detailed Summary")]
-    b += [("p", para) for para in s["detailed"].split("\n\n") if para.strip()]
-    b.append(("h2", "Important Points"))
+def summary_blocks(s):
+    b = [("h1", "Lecture Summary"), ("h2", "Short Summary"), ("p", s["short"]), ("h2", "Detailed Summary")]
+    b += [("p", p) for p in s["detailed"].split("\n\n") if p.strip()]
+    b.append(("h2", "Key Points"))
     b += [("bullet", k) for k in s["key_points"]]
     return b
 
@@ -662,11 +457,11 @@ def roadmap_blocks(r):
         b.append(("h2", f"Phase {i}: {p['name']} ({p['weeks']} weeks)"))
         b += [("bullet", t) for t in p["topics"]]
         b.append(("p", f"Milestone: {p['milestone']}"))
-        b += [("bullet", f"Resource: {x['title']} [{x['type']}]") for x in p.get("resources", [])]
+        b += [("bullet", f"Resource: {x.get('title', '')} [{x.get('type', '')}]") for x in p["resources"]]
     return b
 
 
-def exam_report_blocks(topic, difficulty, score, total, questions, answers):
+def exam_blocks(topic, difficulty, score, total, questions, answers):
     b = [("h1", f"Exam Report - {topic}"),
          ("p", f"Difficulty: {difficulty} | Score: {score}/{total} ({100 * score / total:.1f}%)")]
     for i, q in enumerate(questions):
@@ -681,127 +476,113 @@ def exam_report_blocks(topic, difficulty, score, total, questions, answers):
     return b
 
 
-def build_docx(blocks):
-    doc = Document()
-    for kind, text in blocks:
-        if kind == "h1":
-            doc.add_heading(text, 0)
-        elif kind == "h2":
-            doc.add_heading(text, 2)
-        elif kind == "bullet":
-            doc.add_paragraph(text, style="List Bullet")
+def blocks_to_markdown(blocks):
+    prefix = {"h1": "# ", "h2": "\n## ", "bullet": "- ", "p": ""}
+    return "\n".join(prefix[k] + t + ("\n" if k == "p" else "") for k, t in blocks)
+
+
+def blocks_to_text(blocks):
+    out = []
+    for k, t in blocks:
+        if k == "h1":
+            out += [t.upper(), "=" * len(t), ""]
+        elif k == "h2":
+            out += ["", t, "-" * len(t)]
+        elif k == "bullet":
+            out.append(f"  * {t}")
         else:
-            doc.add_paragraph(text)
-    buf = io.BytesIO()
-    doc.save(buf)
-    return buf.getvalue()
-
-
-def pdf_safe(text):
-    for a, b in {"\u2013": "-", "\u2014": "-", "\u2018": "'", "\u2019": "'", "\u201c": '"',
-                 "\u201d": '"', "\u2022": "-", "\u2026": "...", "\u00a0": " "}.items():
-        text = text.replace(a, b)
-    text = text.encode("latin-1", "replace").decode("latin-1")
-    # break absurdly long unbroken strings so FPDF can wrap them
-    return re.sub(r"(\S{60})(?=\S)", r"\1 ", text)
-
-
-def build_pdf(blocks):
-    pdf = FPDF()
-    pdf.set_auto_page_break(auto=True, margin=15)
-    pdf.add_page()
-    for kind, text in blocks:
-        text = pdf_safe(text)
-        pdf.set_x(pdf.l_margin)
-        if kind == "h1":
-            pdf.set_font("Helvetica", "B", 20)
-            pdf.set_text_color(79, 70, 229)
-            pdf.multi_cell(0, 10, text, new_x="LMARGIN", new_y="NEXT")
-            pdf.ln(2)
-        elif kind == "h2":
-            pdf.ln(3)
-            pdf.set_font("Helvetica", "B", 13)
-            pdf.set_text_color(124, 58, 237)
-            pdf.multi_cell(0, 8, text, new_x="LMARGIN", new_y="NEXT")
-        else:
-            pdf.set_font("Helvetica", "", 11)
-            pdf.set_text_color(30, 30, 30)
-            pdf.multi_cell(0, 6, ("- " + text) if kind == "bullet" else text,
-                           new_x="LMARGIN", new_y="NEXT")
-            pdf.ln(1)
-    return bytes(pdf.output())
+            out += [t, ""]
+    return "\n".join(out)
 
 
 def download_buttons(blocks, filename, key):
     c1, c2 = st.columns(2)
-    try:
-        c1.download_button("⬇️ Download Word (.docx)", build_docx(blocks), f"{filename}.docx",
-                           "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                           key=f"{key}_docx")
-        c2.download_button("⬇️ Download PDF", build_pdf(blocks), f"{filename}.pdf",
-                           "application/pdf", key=f"{key}_pdf")
-    except Exception as e:
-        st.error(f"Could not build the download files: {e}")
+    c1.download_button("⬇️ Download Markdown (.md)", blocks_to_markdown(blocks), f"{filename}.md",
+                       "text/markdown", key=f"{key}_md")
+    c2.download_button("⬇️ Download Text (.txt)", blocks_to_text(blocks), f"{filename}.txt",
+                       "text/plain", key=f"{key}_txt")
+
+
+def safe_name(text):
+    return re.sub(r"\W+", "_", text).strip("_")[:50] or "arora_rain"
 
 
 # =============================================================================
-# 6. CHARTS  (Plotly + Matplotlib + Seaborn)
+# 6. CHARTS  (Matplotlib + Seaborn, data prepared with Pandas + NumPy)
 # =============================================================================
+def show_fig(fig):
+    st.pyplot(fig)
+    plt.close(fig)
+
+
 def chart_score_trend(df):
-    fig = px.line(df, x="date", y="percent", markers=True, hover_data=["topic", "difficulty"],
-                  title="Exam scores over time (Plotly)")
-    fig.update_traces(line=dict(color="#7c3aed", width=3), marker=dict(size=10))
-    fig.update_layout(yaxis_range=[0, 105], yaxis_title="Score %", xaxis_title="",
-                      margin=dict(l=10, r=10, t=50, b=10))
-    return fig
-
-
-def chart_progress_gauge(done, total):
-    pct = 100 * done / total if total else 0
-    fig = go.Figure(go.Indicator(
-        mode="gauge+number", value=pct, number={"suffix": "%"},
-        title={"text": "Roadmap progress (Plotly)"},
-        gauge={"axis": {"range": [0, 100]}, "bar": {"color": "#7c3aed"},
-               "steps": [{"range": [0, 50], "color": "#e0e7ff"}, {"range": [50, 100], "color": "#c7d2fe"}]}))
-    fig.update_layout(height=300, margin=dict(l=20, r=20, t=60, b=10))
-    return fig
-
-
-def chart_avg_by_difficulty(df):
-    avg = df.groupby("difficulty")["percent"].mean().reindex(["Easy", "Medium", "Hard", "Mixed"]).dropna()
-    fig, ax = plt.subplots(figsize=(5, 3.4))
-    ax.bar(avg.index, avg.values, color=["#22c55e", "#f59e0b", "#ef4444", "#7c3aed"][:len(avg)])
-    ax.set_ylim(0, 100)
-    ax.set_ylabel("Average score %")
-    ax.set_title("Average score by difficulty (Matplotlib)")
-    for i, v in enumerate(avg.values):
-        ax.text(i, v + 2, f"{v:.0f}%", ha="center")
+    d = df.copy()
+    d["attempt"] = np.arange(1, len(d) + 1)
+    fig, ax = plt.subplots(figsize=(6, 3.6))
+    sns.lineplot(data=d, x="attempt", y="percent", marker="o", color=PRIMARY, linewidth=2.5, ax=ax)
+    if len(d) >= 3:                                   # NumPy linear trend line
+        slope, intercept = np.polyfit(d["attempt"], d["percent"], 1)
+        ax.plot(d["attempt"], slope * d["attempt"] + intercept, "--", color=ACCENT, label="Trend")
+        ax.legend()
+    ax.set(ylim=(0, 105), xlabel="Exam attempt", ylabel="Score %", title="Score trend (Seaborn)")
+    ax.set_xticks(d["attempt"])
     fig.tight_layout()
     return fig
 
 
-def chart_activity_heatmap(activity):
-    df = pd.DataFrame(activity)
-    cutoff = (date.today() - timedelta(days=13)).isoformat()
-    df = df[df["date"] >= cutoff]
-    if df.empty:
+def chart_by_difficulty(df):
+    avg = (df.groupby("difficulty")["percent"].mean()
+           .reindex(["Easy", "Medium", "Hard", "Mixed"]).dropna().reset_index())
+    fig, ax = plt.subplots(figsize=(6, 3.6))
+    bars = ax.bar(avg["difficulty"], avg["percent"], color=["#22c55e", "#f59e0b", "#ef4444", SECONDARY][:len(avg)])
+    for rect, v in zip(bars, avg["percent"]):
+        ax.text(rect.get_x() + rect.get_width() / 2, v + 2, f"{v:.0f}%", ha="center", fontweight="bold")
+    ax.set(ylim=(0, 110), ylabel="Average score %", title="Average score by difficulty (Matplotlib)")
+    fig.tight_layout()
+    return fig
+
+
+def chart_distribution(df):
+    fig, ax = plt.subplots(figsize=(6, 3.6))
+    sns.histplot(df["percent"], bins=np.arange(0, 110, 10), color=SECONDARY, ax=ax)
+    ax.set(xlabel="Score %", ylabel="Exams", title="Score distribution (Seaborn)")
+    fig.tight_layout()
+    return fig
+
+
+def chart_topics(df):
+    avg = df.groupby("topic")["percent"].mean().sort_values().tail(8)
+    fig, ax = plt.subplots(figsize=(6, 3.6))
+    colors = [("#22c55e" if v >= 70 else "#f59e0b" if v >= 50 else "#ef4444") for v in avg.values]
+    ax.barh(avg.index, avg.values, color=colors)
+    ax.set(xlim=(0, 100), xlabel="Average score %", title="Performance by topic (Matplotlib)")
+    fig.tight_layout()
+    return fig
+
+
+def chart_heatmap(activity):
+    d = pd.DataFrame(activity)
+    days = pd.date_range(end=pd.Timestamp.today().normalize(), periods=14)
+    d = d[d["date"].isin(days.strftime("%Y-%m-%d"))]
+    if d.empty:
         return None
-    pivot = df.pivot_table(index="type", columns="date", values="detail", aggfunc="count", fill_value=0)
+    pivot = d.groupby(["type", "date"]).size().unstack(fill_value=0)
+    pivot = pivot.reindex(columns=days.strftime("%Y-%m-%d"), fill_value=0)
     pivot.columns = [c[5:] for c in pivot.columns]
-    fig, ax = plt.subplots(figsize=(6, 3.4))
+    fig, ax = plt.subplots(figsize=(8, 3.4))
     sns.heatmap(pivot, annot=True, fmt="d", cmap="Purples", cbar=False, linewidths=.5, ax=ax)
-    ax.set_title("Activity - last 14 days (Seaborn)")
-    ax.set_xlabel("")
-    ax.set_ylabel("")
+    ax.set(title="Learning activity - last 14 days (Seaborn)", xlabel="", ylabel="")
     fig.tight_layout()
     return fig
 
 
-def chart_score_distribution(df):
-    fig, ax = plt.subplots(figsize=(5, 3.4))
-    sns.histplot(df["percent"], bins=np.arange(0, 110, 10), color="#4f46e5", ax=ax)
-    ax.set_xlabel("Score %")
-    ax.set_title("Score distribution (Seaborn)")
+def chart_progress_donut(done, total):
+    fig, ax = plt.subplots(figsize=(4.2, 3.6))
+    pct = 100 * done / total if total else 0
+    ax.pie([done, max(total - done, 0)] if total else [0, 1], colors=[SECONDARY, "#e5e7eb"],
+           startangle=90, counterclock=False, wedgeprops=dict(width=0.32))
+    ax.text(0, 0, f"{pct:.0f}%", ha="center", va="center", fontsize=24, fontweight="bold", color=PRIMARY)
+    ax.set_title("Roadmap progress (Matplotlib)")
     fig.tight_layout()
     return fig
 
@@ -843,8 +624,8 @@ def show_celebration(score, total):
         title, msg = "Well Done!", "You're on the right track. Review the explanations below and you'll improve fast."
     else:
         title, msg = "You Showed Up - That Counts!", "Every expert started here. Learn from the explanations and try again - you've got this!"
-    html = (FIREWORKS_HTML.replace("__TITLE__", title)
-            .replace("__SCORE__", f"{score}/{total} ({pct:.0f}%)").replace("__MESSAGE__", msg))
+    html = (FIREWORKS_HTML.replace("__TITLE__", title).replace("__SCORE__", f"{score}/{total} ({pct:.0f}%)")
+            .replace("__MESSAGE__", msg))
     components.html(html, height=440)
     if pct >= 70:
         st.balloons()
@@ -853,55 +634,44 @@ def show_celebration(score, total):
 # =============================================================================
 # 7. PAGES  (Streamlit)
 # =============================================================================
-def read_upload(file):
-    """Read text from .txt / .md / .pdf / .docx uploads."""
-    name = file.name.lower()
+def run_ai(label, func):
+    """Run an AI task with a spinner and uniform error display. Returns None on failure."""
     try:
-        if name.endswith((".txt", ".md")):
-            return file.read().decode("utf-8", errors="ignore")
-        if name.endswith(".pdf"):
-            from pypdf import PdfReader
-            return "\n".join((p.extract_text() or "") for p in PdfReader(file).pages)
-        if name.endswith(".docx"):
-            return "\n".join(p.text for p in Document(file).paragraphs)
-    except Exception as e:
-        st.error(f"Could not read '{file.name}': {e}")
-        return ""
-    st.error("Unsupported file type. Use .txt, .md, .pdf or .docx.")
-    return ""
+        with st.spinner(label):
+            return func()
+    except AIError as e:
+        st.error(str(e))
+        return None
 
 
 def page_home():
     hero("🌧️ Arora Rain", "Your personal AI learning companion - learn, summarise, practise and grow.")
-    data = load_data()
-    df = exams_dataframe()
+    data, df = load_data(), exams_df()
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Topics completed", len(data["completed_topics"]))
     c2.metric("Exams taken", len(df))
-    c3.metric("Average score", f"{df['percent'].mean():.0f}%" if not df.empty else "-")
+    c3.metric("Average score", f"{np.mean(df['percent']):.0f}%" if not df.empty else "-")
     c4.metric("Day streak 🔥", current_streak())
     st.write("")
-    feats = [("🧠 AI Learning Assistant", "Ask about any topic and get clear explanations with examples."),
-             ("📝 Lecture Summarizer", "Short and detailed summaries with the key points highlighted."),
-             ("📒 Smart Notes", "Structured notes you can download as PDF or Word."),
+    feats = [("🧠 AI Learning Assistant", "Ask about any topic and get a clear explanation with examples."),
+             ("📝 Lecture Summarizer", "Short and detailed summaries with key points."),
+             ("📒 Smart Notes", "Organised notes with headings, definitions and examples."),
              ("🎯 AI Exam Generator", "10-100 MCQs, difficulty levels, marks and explanations."),
              ("🗺️ Learning Roadmap", "A personalised plan with milestones and resources."),
-             ("📊 Progress Dashboard", "Track topics, scores and activity with live charts.")]
+             ("📊 Progress Dashboard", "Track scores, topics and activity with live charts.")]
     cols = st.columns(3)
     for i, (t, d) in enumerate(feats):
         with cols[i % 3]:
             card(t, f"<p style='margin:0;opacity:.85'>{d}</p>")
-    st.markdown("#### 🎁 Recommended for you")
-    for name, sim in recommend_topics():
-        tag = f" <span class='pill'>match {sim * 100:.0f}%</span>" if sim is not None else ""
-        st.markdown(f"- **{name}**{tag}", unsafe_allow_html=True)
-    if not ai_enabled():
-        st.info("Tip: add your Claude API key in the sidebar for AI-generated content. "
-                "Without it, Arora Rain uses its offline engine (Wikipedia + machine learning).")
+    if not get_api_key():
+        st.warning("🔑 Set up your free Gemini API key to enable the AI features:")
+        st.markdown(SETUP_HELP)
 
 
 def page_assistant():
     hero("🧠 AI Learning Assistant", "Enter any topic and get an easy explanation with examples.")
+    if not require_ai():
+        return
     c1, c2 = st.columns([3, 1])
     topic = c1.text_input("What do you want to learn?", placeholder="e.g. Photosynthesis, Recursion, Inflation")
     level = c2.selectbox("Explain for", ["Beginner", "Intermediate", "Advanced"])
@@ -910,62 +680,50 @@ def page_assistant():
         if len(topic) < 2:
             st.error("Please enter a topic (at least 2 characters).")
         else:
-            with st.spinner("Thinking..."):
-                try:
-                    def offline():
-                        md, _ = offline_explanation(topic)
-                        return md
-                    result, mode = with_fallback(lambda: ai_explain(topic, level), offline, "explanations")
-                    st.session_state["explanation"] = {"topic": topic, "text": result, "mode": mode}
-                    log_activity("Explain", topic)
-                except (ValueError, AIError) as e:
-                    st.error(str(e))
+            text = run_ai("Thinking...", lambda: ai_explain(topic, level))
+            if text:
+                st.session_state["explanation"] = {"topic": topic, "text": text}
+                log_activity("Explain", topic)
     exp = st.session_state.get("explanation")
     if exp:
-        st.markdown(f"### 📖 {exp['topic']}  <span class='pill'>{exp['mode'].upper()}</span>",
-                    unsafe_allow_html=True)
+        st.markdown(f"### 📖 {exp['topic']}")
         st.markdown(exp["text"])
-        c1, c2 = st.columns(2)
-        if c1.button("✅ Mark topic as studied"):
+        if st.button("✅ Mark topic as studied"):
             mark_completed(exp["topic"], "assistant")
             st.success("Added to your completed topics!")
-        with c2:
-            pass
-        blocks = [("h1", exp["topic"])] + [
-            ("h2" if l.startswith("##") else "bullet" if l.lstrip().startswith(("-", "*")) else "p",
-             re.sub(r"^[#\-*\s]+", "", l).replace("**", ""))
-            for l in exp["text"].splitlines() if l.strip()]
-        download_buttons(blocks, re.sub(r"\W+", "_", exp["topic"]), "explain")
+        st.download_button("⬇️ Download explanation (.md)", f"# {exp['topic']}\n\n{exp['text']}",
+                           f"{safe_name(exp['topic'])}.md", "text/markdown")
 
 
 def get_source_text(key):
-    """Text area + file uploader used by summarizer and notes pages."""
+    """Text area + .txt/.md upload used by the summarizer and notes pages."""
     text = st.text_area("Paste lecture text", height=220, key=f"{key}_text",
                         placeholder="Paste your lecture notes or transcript here...")
-    up = st.file_uploader("...or upload a document (.txt, .md, .pdf, .docx)",
-                          type=["txt", "md", "pdf", "docx"], key=f"{key}_up")
+    up = st.file_uploader("...or upload a text file (.txt or .md)", type=["txt", "md"], key=f"{key}_up")
     if up is not None:
-        extracted = read_upload(up)
-        if extracted.strip():
-            st.caption(f"Loaded {len(extracted.split())} words from {up.name}")
-            text = extracted
+        try:
+            extracted = up.read().decode("utf-8", errors="ignore")
+            if extracted.strip():
+                st.caption(f"Loaded {len(extracted.split())} words from {up.name}")
+                text = extracted
+        except Exception as e:
+            st.error(f"Could not read '{up.name}': {e}")
     return text.strip()
 
 
 def page_summarizer():
     hero("📝 Lecture Summarizer", "Turn long lectures into short and detailed summaries.")
+    if not require_ai():
+        return
     text = get_source_text("sum")
     if st.button("Summarise"):
         if len(text.split()) < 40:
             st.error("Please provide at least 40 words of text.")
         else:
-            with st.spinner("Summarising..."):
-                try:
-                    res, mode = with_fallback(lambda: ai_summary(text), lambda: offline_summary(text), "summaries")
-                    st.session_state["summary"] = res
-                    log_activity("Summarize", f"{len(text.split())} words")
-                except (ValueError, AIError) as e:
-                    st.error(str(e))
+            res = run_ai("Summarising...", lambda: ai_summary(text))
+            if res:
+                st.session_state["summary"] = res
+                log_activity("Summarize", f"{len(text.split())} words")
     s = st.session_state.get("summary")
     if s:
         t1, t2, t3 = st.tabs(["⚡ Short", "📄 Detailed", "⭐ Key points"])
@@ -978,62 +736,54 @@ def page_summarizer():
 
 
 def page_notes():
-    hero("📒 Smart Notes Generator", "Convert lecture content into organised, downloadable notes.")
-    title = st.text_input("Notes title", "My Study Notes")
-    mode = st.radio("Source", ["Paste / upload text", "Generate from a topic"], horizontal=True)
-    text, topic = "", ""
-    if mode == "Paste / upload text":
+    hero("📒 Smart Notes Generator", "Convert lecture content or a topic into organised notes.")
+    if not require_ai():
+        return
+    title = st.text_input("Notes title (optional)")
+    mode = st.radio("Source", ["Paste / upload lecture", "Generate from a topic"], horizontal=True)
+    text = topic = ""
+    if mode == "Paste / upload lecture":
         text = get_source_text("notes")
     else:
         topic = st.text_input("Topic", placeholder="e.g. Machine Learning")
     if st.button("Create notes"):
-        try:
-            if mode == "Paste / upload text":
-                if len(text.split()) < 40:
-                    raise ValueError("Please provide at least 40 words of text.")
-                notes, _ = with_fallback(lambda: ai_notes(text, title),
-                                         lambda: offline_notes(text, title), "notes")
-            else:
-                if len(topic.strip()) < 2:
-                    raise ValueError("Please enter a topic.")
-                def ai():
-                    return ai_notes(call_llm(f"Write a detailed lecture on: {topic}", max_tokens=3000),
-                                    title or topic)
-
-                def offline():
-                    page = fetch_wikipedia(topic.strip())
-                    if not page:
-                        raise ValueError("No offline source found for that topic.")
-                    return offline_notes(" ".join(s["text"] for s in page["sections"]),
-                                         title or page["title"], page["sections"])
-                notes, _ = with_fallback(ai, offline, "notes")
-            st.session_state["notes"] = notes
-            log_activity("Notes", notes["title"])
-        except (ValueError, AIError) as e:
-            st.error(str(e))
+        from_topic = mode != "Paste / upload lecture"
+        source = topic.strip() if from_topic else text
+        if from_topic and len(source) < 2:
+            st.error("Please enter a topic.")
+        elif not from_topic and len(source.split()) < 40:
+            st.error("Please provide at least 40 words of text.")
+        else:
+            notes = run_ai("Writing notes...", lambda: ai_notes(source, title.strip() or (source if from_topic else ""), from_topic))
+            if notes:
+                st.session_state["notes"] = notes
+                log_activity("Notes", notes["title"])
     n = st.session_state.get("notes")
     if n:
         st.markdown(f"## {n['title']}")
         for s in n["sections"]:
-            st.markdown(f"### {s['heading']}")
-            for p in s["points"]:
+            st.markdown(f"### {s.get('heading', '')}")
+            for p in s.get("points", []):
                 st.markdown(f"- {p}")
         if n["definitions"]:
             st.markdown("### 📚 Definitions")
             for d in n["definitions"]:
-                st.markdown(f"- **{d['term']}** - {d['meaning']}")
+                st.markdown(f"- **{d.get('term', '')}** - {d.get('meaning', '')}")
         if n["examples"]:
             st.markdown("### 💡 Examples")
             for e in n["examples"]:
                 st.markdown(f"- {e}")
-        st.markdown("### ⭐ Key points")
-        for k in n["key_points"]:
-            st.markdown(f"- {k}")
-        download_buttons(notes_blocks(n), re.sub(r"\W+", "_", n["title"]), "notes")
+        if n["key_points"]:
+            st.markdown("### ⭐ Key points")
+            for k in n["key_points"]:
+                st.markdown(f"- {k}")
+        download_buttons(notes_blocks(n), safe_name(n["title"]), "notes")
 
 
 def page_exam():
     hero("🎯 AI Exam Generator", "Practise with custom MCQs, get marks and explanations.")
+    if not require_ai():
+        return
     ex = st.session_state.get("exam")
 
     if ex is None:
@@ -1047,25 +797,22 @@ def page_exam():
             if len(topic.strip()) < 2:
                 st.error("Please enter a topic.")
                 return
-            with st.spinner(f"Creating {n} questions..."):
-                try:
-                    qs, mode = with_fallback(lambda: ai_exam(topic.strip(), difficulty, n),
-                                             lambda: offline_exam(topic.strip(), difficulty, n), "exams")
-                except (ValueError, AIError) as e:
-                    st.error(str(e))
-                    return
-            if len(qs) < n:
-                st.warning(f"Only {len(qs)} questions could be generated from the available source text.")
+            bar = st.progress(0.0, text=f"Creating {n} questions...")
+            try:
+                qs = ai_exam(topic.strip(), difficulty, n, progress=lambda p: bar.progress(p))
+            except AIError as e:
+                bar.empty()
+                st.error(str(e))
+                return
+            bar.empty()
             st.session_state["exam"] = {"id": uuid.uuid4().hex[:8], "topic": topic.strip(),
-                                        "difficulty": difficulty, "questions": qs,
-                                        "submitted": False, "mode": mode}
+                                        "difficulty": difficulty, "questions": qs, "submitted": False}
             st.rerun()
         return
 
     qs = ex["questions"]
     st.markdown(f"### {ex['topic']}  <span class='pill'>{ex['difficulty']}</span>"
-                f"<span class='pill'>{len(qs)} questions</span><span class='pill'>{ex['mode'].upper()}</span>",
-                unsafe_allow_html=True)
+                f"<span class='pill'>{len(qs)} questions</span>", unsafe_allow_html=True)
 
     if not ex["submitted"]:
         with st.form("exam_form"):
@@ -1096,7 +843,7 @@ def page_exam():
         c1.metric("Marks", f"{score}/{total}")
         c2.metric("Percentage", f"{100 * score / total:.1f}%")
         c3.metric("Wrong / skipped", total - score)
-        st.markdown("### 🔍 Review")
+        st.markdown("### 🔍 Review of incorrect answers")
         wrong = 0
         for i, q in enumerate(qs):
             chosen = ex["answers"].get(i)
@@ -1109,7 +856,7 @@ def page_exam():
                 st.info(q["explanation"] or "No explanation provided.")
         if wrong == 0:
             st.success("Perfect score - nothing to review! 🌟")
-        download_buttons(exam_report_blocks(ex["topic"], ex["difficulty"], score, total, qs, ex["answers"]),
+        download_buttons(exam_blocks(ex["topic"], ex["difficulty"], score, total, qs, ex["answers"]),
                          "exam_report", "exam")
         if st.button("🔄 Start a new exam"):
             st.session_state["exam"] = None
@@ -1123,8 +870,17 @@ def toggle_topic(topic, key):
         unmark_completed(topic)
 
 
+def resource_link(title, rtype, field):
+    q = quote_plus(f"{title} {field}")
+    if str(rtype).lower() == "video":
+        return f"https://www.youtube.com/results?search_query={q}"
+    return f"https://www.google.com/search?q={q}"
+
+
 def page_roadmap():
-    hero("🗺️ Personalised Learning Roadmap", "Tell us your goal - we'll plan the journey.")
+    hero("🗺️ Personalised Learning Roadmap", "Tell us your goal - Gemini plans the journey.")
+    if not require_ai():
+        return
     with st.form("roadmap_form"):
         field = st.text_input("Learning field", placeholder="e.g. Data Science, Web Design, Biology")
         c1, c2 = st.columns(2)
@@ -1135,20 +891,19 @@ def page_roadmap():
         if len(field.strip()) < 2:
             st.error("Please enter your learning field.")
         else:
-            with st.spinner("Designing your roadmap..."):
-                rm, mode = with_fallback(lambda: ai_roadmap(field.strip(), level, hours),
-                                         lambda: offline_roadmap(field.strip(), level, hours), "roadmaps")
-            rm.update(field=field.strip(), level=level, hours=hours)
-            data = load_data()
-            data["roadmap"] = rm
-            save_data(data)
-            log_activity("Roadmap", field.strip())
+            rm = run_ai("Designing your roadmap...", lambda: ai_roadmap(field.strip(), level, hours))
+            if rm:
+                rm.update(field=field.strip(), level=level, hours=hours)
+                data = load_data()
+                data["roadmap"] = rm
+                save_data(data)
+                log_activity("Roadmap", field.strip())
     rm = load_data().get("roadmap")
     if not rm:
         st.info("Fill in the form above to generate your roadmap.")
         return
     st.markdown(f"## {rm['title']}")
-    st.caption(rm.get("summary", ""))
+    st.caption(f"{rm.get('summary', '')}  •  about {rm['total_weeks']} weeks")
     done_set = {t["topic"].lower() for t in load_data()["completed_topics"]}
     for i, p in enumerate(rm["phases"]):
         with st.expander(f"Phase {i + 1}: {p['name']}  -  {p['weeks']} week(s)", expanded=(i == 0)):
@@ -1156,59 +911,76 @@ def page_roadmap():
                 key = f"rm_{i}_{j}"
                 st.checkbox(t, value=t.lower() in done_set, key=key, on_change=toggle_topic, args=(t, key))
             st.markdown(f"🏁 **Milestone:** {p['milestone']}")
-            for r in p.get("resources", []):
-                link = resource_link(r["title"], r.get("type", ""), rm.get("field", ""))
-                st.markdown(f"- [{r['title']}]({link})  <span class='pill'>{r.get('type', '')}</span>",
+            for r in p["resources"]:
+                link = resource_link(r.get("title", ""), r.get("type", ""), rm.get("field", ""))
+                st.markdown(f"- [{r.get('title', '')}]({link})  <span class='pill'>{r.get('type', '')}</span>",
                             unsafe_allow_html=True)
     download_buttons(roadmap_blocks(rm), "learning_roadmap", "rm")
 
 
 def page_dashboard():
     hero("📊 Progress Dashboard", "See how far you've come.")
-    data = load_data()
-    df = exams_dataframe()
-    c1, c2, c3, c4 = st.columns(4)
+    data, df = load_data(), exams_df()
+    pct = df["percent"].to_numpy(dtype=float)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Topics completed", len(data["completed_topics"]))
     c2.metric("Exams taken", len(df))
-    c3.metric("Best score", f"{df['percent'].max():.0f}%" if not df.empty else "-")
-    c4.metric("Day streak 🔥", current_streak())
+    c3.metric("Average score", f"{np.mean(pct):.0f}%" if len(pct) else "-")
+    c4.metric("Best score", f"{np.max(pct):.0f}%" if len(pct) else "-")
+    if len(pct) >= 2:
+        slope = np.polyfit(np.arange(len(pct)), pct, 1)[0]
+        c5.metric("Trend", f"{slope:+.1f}% / exam")
+    else:
+        c5.metric("Day streak 🔥", current_streak())
+    if len(pct) >= 2:
+        st.caption(f"Consistency (std. deviation): {np.std(pct):.1f} points  •  "
+                   f"Median: {np.median(pct):.0f}%  •  Day streak: {current_streak()} 🔥")
 
-    left, right = st.columns(2)
     rm = data.get("roadmap")
+    left, right = st.columns(2)
     with left:
+        if len(df):
+            show_fig(chart_score_trend(df))
+        else:
+            st.info("Take an exam to see your score trend.")
+    with right:
         if rm:
             topics = [t for p in rm["phases"] for t in p["topics"]]
             done = {t["topic"].lower() for t in data["completed_topics"]}
-            st.plotly_chart(chart_progress_gauge(sum(t.lower() in done for t in topics), len(topics)),
-                            use_container_width=True)
+            show_fig(chart_progress_donut(sum(t.lower() in done for t in topics), len(topics)))
         else:
-            st.info("Create a roadmap to see your progress gauge.")
-    with right:
-        if not df.empty:
-            st.plotly_chart(chart_score_trend(df), use_container_width=True)
-        else:
-            st.info("Take an exam to see your score trend.")
-
-    if not df.empty:
+            st.info("Create a roadmap to see your progress donut.")
+    if len(df):
         a, b = st.columns(2)
-        a.pyplot(chart_avg_by_difficulty(df))
-        b.pyplot(chart_score_distribution(df))
+        with a:
+            show_fig(chart_by_difficulty(df))
+        with b:
+            show_fig(chart_distribution(df))
+        show_fig(chart_topics(df))
     if data["activity"]:
-        fig = chart_activity_heatmap(data["activity"])
+        fig = chart_heatmap(data["activity"])
         if fig:
-            st.pyplot(fig)
+            show_fig(fig)
 
     st.markdown("### ✅ Completed topics")
     if data["completed_topics"]:
         st.dataframe(pd.DataFrame(data["completed_topics"]), use_container_width=True, hide_index=True)
     else:
         st.caption("Nothing yet - study a topic and mark it as completed!")
-    st.markdown("### 📝 Exam history")
-    if not df.empty:
+    if len(df):
+        st.markdown("### 📝 Exam history")
         st.dataframe(df, use_container_width=True, hide_index=True)
-    st.markdown("### 🎁 Recommended next topics (Scikit-learn)")
-    for name, sim in recommend_topics():
-        st.markdown(f"- **{name}**" + (f" - similarity {sim * 100:.0f}%" if sim is not None else ""))
+
+    st.markdown("### 🎁 What should I learn next?")
+    if get_api_key():
+        if st.button("Ask Gemini for recommendations"):
+            recs = run_ai("Thinking...", lambda: ai_recommendations(df, [t["topic"] for t in data["completed_topics"]]))
+            if recs:
+                st.session_state["recs"] = recs
+        for r in st.session_state.get("recs", []):
+            st.markdown(f"- **{r['topic']}** - {r.get('reason', '')}")
+    else:
+        st.caption("Add your Gemini key to get personalised recommendations.")
     with st.expander("⚠️ Danger zone"):
         if st.button("Reset all progress"):
             save_data(default_data())
@@ -1217,7 +989,7 @@ def page_dashboard():
 
 
 # =============================================================================
-# MAIN: sidebar navigation
+# 8. MAIN: sidebar navigation
 # =============================================================================
 PAGES = {"🏠 Home": page_home, "🧠 AI Assistant": page_assistant, "📝 Summarizer": page_summarizer,
          "📒 Smart Notes": page_notes, "🎯 Exam Generator": page_exam,
@@ -1230,14 +1002,20 @@ def main():
         st.caption("AI Learning Companion")
         choice = st.radio("Navigate", list(PAGES.keys()), label_visibility="collapsed")
         st.divider()
-        st.markdown("**🔑 AI settings**")
-        st.text_input("Claude API key", type="password", key="api_key",
-                      help="Stored only in this browser session. You can also set ANTHROPIC_API_KEY.")
-        st.text_input("Model", value=DEFAULT_MODEL, key="model")
-        st.caption("AI mode: ✅ ON" if ai_enabled() else "AI mode: ⚪ offline engine")
+        st.markdown("**✨ Gemini AI**")
+        st.text_input("Model", value=get_model(), key="model",
+                      help="Any Gemini model name from aistudio.google.com")
+        if get_api_key():
+            st.caption("🔑 API key loaded (secrets / env)")
+            if st.button("🔌 Test connection"):
+                res = run_ai("Testing...", lambda: generate("Reply with the single word: OK", temperature=0))
+                if res:
+                    st.success("Gemini is connected!")
+        else:
+            st.caption("⚠️ No API key found - see Home page")
     try:
         PAGES[choice]()
-    except Exception as e:                          # last-resort safety net
+    except Exception as e:                            # last-resort safety net
         st.error(f"Something went wrong: {e}")
 
 
